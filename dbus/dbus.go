@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -98,18 +99,26 @@ type Conn struct {
 		jobs map[dbus.ObjectPath][]chan<- string
 		sync.Mutex
 	}
-	subStateSubscriber struct {
-		updateCh chan<- *SubStateUpdate
-		errCh    chan<- error
-		sync.Mutex
-		ignore      map[dbus.ObjectPath]int64
-		cleanIgnore int64
-	}
-	propertiesSubscriber struct {
-		updateCh chan<- *PropertiesUpdate
-		errCh    chan<- error
-		sync.Mutex
-	}
+
+	// subStateBus and propertiesBus decouple signal dispatch from event
+	// delivery: the dispatch goroutine only publishes into the buses, which
+	// fan out to each subscriber's bounded buffer without ever blocking.
+	subStateBus    *eventBus[*SubStateUpdate]
+	propertiesBus  *eventBus[*PropertiesUpdate]
+	fetchShards    []*fetchShard
+	ignores        *ignoreList
+	legacyMu       sync.Mutex
+	legacySubState *UnitSubscription[*SubStateUpdate]
+	legacyProps    *UnitSubscription[*PropertiesUpdate]
+
+	// bgCtx is canceled by Close; every long-lived background goroutine
+	// selects on it (or on stopCh) so shutdown wakes them all.
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	stopCh   chan struct{}
+	closeWG  sync.WaitGroup
+	closeMu  sync.Mutex
+	closed   bool
 }
 
 // Deprecated: use NewWithContext instead.
@@ -171,11 +180,44 @@ func NewSystemdConnectionContext(ctx context.Context) (*Conn, error) {
 	})
 }
 
-// Close closes an established connection.
+// Close closes an established connection. It wakes every background goroutine
+// (signal dispatch, fetch workers, ignore-list sweeper and all subscriber
+// delivery goroutines) and waits briefly for them to exit, so after Close
+// returns no goroutine retains the connection.
 func (c *Conn) Close() {
+	c.closeMu.Lock()
+	if c.closed {
+		c.closeMu.Unlock()
+		return
+	}
+	c.closed = true
+	c.closeMu.Unlock()
+
+	// Stop all background work and reject further subscriptions first.
+	c.bgCancel()
+	close(c.stopCh)
+	c.subStateBus.close()
+	c.propertiesBus.close()
+
+	// Closing the bus connections closes the registered signal channel, which
+	// lets the dispatch goroutine drain and exit.
 	c.sysconn.Close()
 	c.sigconn.Close()
+
+	// Bounded wait so a wedged goroutine cannot make Close hang forever.
+	done := make(chan struct{})
+	go func() {
+		c.closeWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownTimeout):
+	}
 }
+
+// shutdownTimeout bounds how long Close waits for background goroutines.
+const shutdownTimeout = 5 * time.Second
 
 // Connected returns whether conn is connected
 func (c *Conn) Connected() bool {
@@ -206,13 +248,22 @@ func NewConnection(dialBus func() (*dbus.Conn, error)) (*Conn, error) {
 		sigobj:  systemdObject(sigconn),
 	}
 
-	c.subStateSubscriber.ignore = make(map[dbus.ObjectPath]int64)
 	c.jobListener.jobs = make(map[dbus.ObjectPath][]chan<- string)
+	c.subStateBus = newEventBus[*SubStateUpdate]()
+	c.propertiesBus = newEventBus[*PropertiesUpdate]()
+	c.fetchShards = newFetchShards(c)
+	c.ignores = newIgnoreList()
+	c.bgCtx, c.bgCancel = context.WithCancel(context.Background())
+	c.stopCh = make(chan struct{})
 
 	// Setup the listeners on jobs so that we can get completions
 	c.sigconn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0,
 		"type='signal', interface='org.freedesktop.systemd1.Manager', member='JobRemoved'")
 
+	c.ignores.run(c.stopCh, &c.closeWG)
+	for _, shard := range c.fetchShards {
+		shard.run(c.stopCh, &c.closeWG)
+	}
 	c.dispatch()
 	return c, nil
 }

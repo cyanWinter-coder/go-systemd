@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"path"
 	"strconv"
 
@@ -44,11 +45,19 @@ func (c *Conn) jobComplete(signal *dbus.Signal) {
 
 	_ = dbus.Store(signal.Body, &id, &job, &unit, &result)
 	c.jobListener.Lock()
-	for _, out := range c.jobListener.jobs[job] {
-		out <- result
-	}
+	listeners := c.jobListener.jobs[job]
 	delete(c.jobListener.jobs, job)
 	c.jobListener.Unlock()
+
+	// Deliver without blocking: a caller that never reads its job channel
+	// must not be able to stall signal dispatch for every other unit.
+	for _, out := range listeners {
+		select {
+		case out <- result:
+		default:
+			log.Printf("full job result channel, dropping result %q\n", result)
+		}
+	}
 }
 
 func (c *Conn) startJob(ctx context.Context, ch chan<- string, job string, args ...any) (int, error) {

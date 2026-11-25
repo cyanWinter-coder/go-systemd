@@ -46,53 +46,89 @@ func (c *Conn) Unsubscribe() error {
 	return c.sigobj.Call("org.freedesktop.systemd1.Manager.Unsubscribe", 0).Store()
 }
 
+// hasSubscribers reports whether the bus currently has any subscriber.
+func (b *eventBus[T]) hasSubscribers() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.subs) > 0
+}
+
+// dispatch consumes the raw D-Bus signal channel. Its only jobs are to
+// classify signals and hand work off: property events are published directly
+// (non-blocking) and substate fetches are queued to the fetch shards. It never
+// performs a blocking RPC or a blocking channel send, so a slow consumer cannot
+// stall signal delivery for any other unit. The goroutine exits when the signal
+// channel is closed by Conn.Close.
 func (c *Conn) dispatch() {
 	ch := make(chan *dbus.Signal, signalBuffer)
-
 	c.sigconn.Signal(ch)
 
+	c.closeWG.Add(1)
 	go func() {
-		for {
-			signal, ok := <-ch
-			if !ok {
-				return
-			}
-
-			if signal.Name == "org.freedesktop.systemd1.Manager.JobRemoved" {
-				c.jobComplete(signal)
-			}
-
-			if c.subStateSubscriber.updateCh == nil &&
-				c.propertiesSubscriber.updateCh == nil {
-				continue
-			}
-
-			var unitPath dbus.ObjectPath
-			switch signal.Name {
-			case "org.freedesktop.systemd1.Manager.JobRemoved":
-				unitName := signal.Body[2].(string)
-				_ = c.sysobj.Call("org.freedesktop.systemd1.Manager.GetUnit", 0, unitName).Store(&unitPath)
-			case "org.freedesktop.systemd1.Manager.UnitNew":
-				unitPath = signal.Body[1].(dbus.ObjectPath)
-			case "org.freedesktop.DBus.Properties.PropertiesChanged":
-				if signal.Body[0].(string) == "org.freedesktop.systemd1.Unit" {
-					unitPath = signal.Path
-
-					if len(signal.Body) >= 2 {
-						if changed, ok := signal.Body[1].(map[string]dbus.Variant); ok {
-							c.sendPropertiesUpdate(unitPath, changed)
-						}
-					}
-				}
-			}
-
-			if unitPath == dbus.ObjectPath("") {
-				continue
-			}
-
-			c.sendSubStateUpdate(unitPath)
+		defer c.closeWG.Done()
+		for signal := range ch {
+			c.handleSignal(signal)
 		}
 	}()
+}
+
+func (c *Conn) handleSignal(signal *dbus.Signal) {
+	if signal.Name == "org.freedesktop.systemd1.Manager.JobRemoved" {
+		c.jobComplete(signal)
+	}
+
+	subStateSubs := c.subStateBus.hasSubscribers()
+	propertiesSubs := c.propertiesBus.hasSubscribers()
+	if !subStateSubs && !propertiesSubs {
+		return
+	}
+
+	switch signal.Name {
+	case "org.freedesktop.systemd1.Manager.JobRemoved":
+		// JobRemoved only drives substate refreshes; nothing to do if nobody
+		// subscribes to those.
+		if !subStateSubs {
+			return
+		}
+		unitName, ok := signal.Body[2].(string)
+		if !ok {
+			return
+		}
+		// The path resolution and property fetch happen off the dispatch
+		// goroutine in the fetch shards.
+		c.enqueueFetch(fetchRequest{unitName: unitName})
+
+	case "org.freedesktop.systemd1.Manager.UnitNew":
+		if !subStateSubs {
+			return
+		}
+		unitPath, ok := signal.Body[1].(dbus.ObjectPath)
+		if !ok || unitPath == "" {
+			return
+		}
+		c.enqueueFetch(fetchRequest{unitPath: unitPath})
+
+	case "org.freedesktop.DBus.Properties.PropertiesChanged":
+		iface, ok := signal.Body[0].(string)
+		if !ok || iface != "org.freedesktop.systemd1.Unit" {
+			return
+		}
+		unitPath := signal.Path
+		if propertiesSubs && len(signal.Body) >= 2 {
+			if changed, ok := signal.Body[1].(map[string]dbus.Variant); ok {
+				c.propertiesBus.publish(&PropertiesUpdate{
+					UnitName: unitName(unitPath),
+					Changed:  changed,
+				})
+			}
+		}
+		// PropertiesChanged carries the new SubState directly, but the
+		// historical behavior also refreshed the full unit status, so keep the
+		// substate fetch for that signal when anyone wants substates.
+		if subStateSubs {
+			c.enqueueFetch(fetchRequest{unitPath: unitPath})
+		}
+	}
 }
 
 // Deprecated: use SubscribeUnitsContext instead.
@@ -183,92 +219,79 @@ type SubStateUpdate struct {
 	SubState string
 }
 
+// eventUnit implements namedEvent so SubStateUpdate can be carried by eventBus.
+func (u *SubStateUpdate) eventUnit() string { return u.UnitName }
+
+// SubscribeSubStates registers a subscriber for unit substate changes. Events
+// are buffered per subscriber up to opts.Buffer; when the consumer falls
+// behind, the oldest buffered event is discarded (counted and reported through
+// UnitSubscription.Err) rather than blocking D-Bus signal dispatch. Coalescing
+// is always enabled for substate events: a pending event for the same unit is
+// replaced by the newer state, so an old state can never overwrite a newer one.
+//
+// The subscription ends when Close is called on the returned handle, when ctx
+// is canceled, or when the Conn is closed; in each case the subscription's
+// channels are closed. Subscribing repeatedly is supported and each call
+// returns an independent subscription.
+func (c *Conn) SubscribeSubStates(ctx context.Context, opts SubscribeOptions) (*UnitSubscription[*SubStateUpdate], error) {
+	opts.Coalesce = true
+	return c.subStateBus.subscribe(ctx, opts, &c.closeWG)
+}
+
 // SetSubStateSubscriber writes to updateCh when any unit's substate changes.
 // Although this writes to updateCh on every state change, the reported state
 // may be more recent than the change that generated it (due to an unavoidable
 // race in the systemd dbus interface).  That is, this method provides a good
 // way to keep a current view of all units' states, but is not guaranteed to
-// show every state transition they go through.  Furthermore, state changes
-// will only be written to the channel with non-blocking writes.  If updateCh
-// is full, it attempts to write an error to errCh; if errCh is full, the error
+// show every state transition they go through.  Furthermore, state changes will
+// only be written to the channel with non-blocking writes.  If updateCh is
+// full, it attempts to write an error to errCh; if errCh is full, the error
 // passes silently.
+//
+// Calling this method again replaces the previous subscriber; passing a nil
+// update channel removes it. The provided channels are owned by the caller and
+// are not closed by this package. Prefer SubscribeSubStates for new code: it
+// supports multiple concurrent subscribers, bounded buffering with drop
+// accounting and explicit unsubscribe.
 func (c *Conn) SetSubStateSubscriber(updateCh chan<- *SubStateUpdate, errCh chan<- error) {
 	if c == nil {
-		msg := "nil receiver"
+		msg := errors.New("nil receiver")
 		select {
-		case errCh <- errors.New(msg):
+		case errCh <- msg:
 		default:
 			log.Printf("full error channel while reporting: %s\n", msg)
 		}
 		return
 	}
 
-	c.subStateSubscriber.Lock()
-	defer c.subStateSubscriber.Unlock()
-	c.subStateSubscriber.updateCh = updateCh
-	c.subStateSubscriber.errCh = errCh
-}
+	c.legacyMu.Lock()
+	defer c.legacyMu.Unlock()
 
-func (c *Conn) sendSubStateUpdate(unitPath dbus.ObjectPath) {
-	c.subStateSubscriber.Lock()
-	defer c.subStateSubscriber.Unlock()
+	if c.legacySubState != nil {
+		c.legacySubState.Close()
+		c.legacySubState = nil
+	}
 
-	if c.subStateSubscriber.updateCh == nil {
+	if updateCh == nil {
 		return
 	}
 
-	isIgnored := c.shouldIgnore(unitPath)
-	defer c.cleanIgnore()
-	if isIgnored {
-		return
-	}
-
-	info, err := c.GetUnitPathProperties(unitPath)
+	sub, err := c.subStateBus.subscribeLegacy(c.bgCtx, updateCh, errCh, true, &c.closeWG)
 	if err != nil {
 		select {
-		case c.subStateSubscriber.errCh <- err:
+		case errCh <- err:
 		default:
 			log.Printf("full error channel while reporting: %s\n", err)
 		}
 		return
 	}
-	defer c.updateIgnore(unitPath, info)
-
-	name, ok := info["Id"].(string)
-	if !ok {
-		msg := "failed to cast info.Id"
-		select {
-		case c.subStateSubscriber.errCh <- errors.New(msg):
-		default:
-			log.Printf("full error channel while reporting: %s\n", err)
-		}
-		return
-	}
-	substate, ok := info["SubState"].(string)
-	if !ok {
-		msg := "failed to cast info.SubState"
-		select {
-		case c.subStateSubscriber.errCh <- errors.New(msg):
-		default:
-			log.Printf("full error channel while reporting: %s\n", msg)
-		}
-		return
-	}
-
-	update := &SubStateUpdate{name, substate}
-	select {
-	case c.subStateSubscriber.updateCh <- update:
-	default:
-		msg := "update channel is full"
-		select {
-		case c.subStateSubscriber.errCh <- errors.New(msg):
-		default:
-			log.Printf("full error channel while reporting: %s\n", msg)
-		}
-		return
-	}
+	c.legacySubState = sub
 }
 
+// updateIgnore marks the unit's path as temporarily ignored when its
+// LoadState is "not-found", to suppress the spurious UnitNew/UnitRemoved signal
+// pair systemd emits for properties requests on unloaded units.
+//
 // The ignore functions work around a wart in the systemd dbus interface.
 // Requesting the properties of an unloaded unit will cause systemd to send a
 // pair of UnitNew/UnitRemoved signals.  Because we need to get a unit's
@@ -282,12 +305,6 @@ func (c *Conn) sendSubStateUpdate(unitPath dbus.ObjectPath) {
 // immediately after requesting its status (with systemctl status, for example,
 // because this causes a UnitNew signal to be sent which then causes us to fetch
 // the properties).
-
-func (c *Conn) shouldIgnore(path dbus.ObjectPath) bool {
-	t, ok := c.subStateSubscriber.ignore[path]
-	return ok && t >= time.Now().UnixNano()
-}
-
 func (c *Conn) updateIgnore(path dbus.ObjectPath, info map[string]any) {
 	loadState, ok := info["LoadState"].(string)
 	if !ok {
@@ -296,21 +313,7 @@ func (c *Conn) updateIgnore(path dbus.ObjectPath, info map[string]any) {
 
 	// unit is unloaded - it will trigger bad systemd dbus behavior
 	if loadState == "not-found" {
-		c.subStateSubscriber.ignore[path] = time.Now().UnixNano() + ignoreInterval
-	}
-}
-
-// without this, ignore would grow unboundedly over time
-func (c *Conn) cleanIgnore() {
-	now := time.Now().UnixNano()
-	if c.subStateSubscriber.cleanIgnore < now {
-		c.subStateSubscriber.cleanIgnore = now + cleanIgnoreInterval
-
-		for p, t := range c.subStateSubscriber.ignore {
-			if t < now {
-				delete(c.subStateSubscriber.ignore, p)
-			}
-		}
+		c.ignores.add(path, time.Duration(ignoreInterval))
 	}
 }
 
@@ -320,40 +323,51 @@ type PropertiesUpdate struct {
 	Changed  map[string]dbus.Variant
 }
 
+// eventUnit implements namedEvent so PropertiesUpdate can be carried by eventBus.
+func (u *PropertiesUpdate) eventUnit() string { return u.UnitName }
+
+// SubscribeProperties registers a subscriber for raw unit property change
+// signals. Every property change reported by systemd is offered to the
+// subscriber; with Coalesce disabled (the default) no transition is collapsed,
+// matching the historical SetPropertiesSubscriber behavior. As with
+// SubscribeSubStates, a slow consumer causes the oldest events to be dropped
+// and counted instead of blocking dispatch, and the subscription ends on Close,
+// context cancellation or Conn.Close.
+func (c *Conn) SubscribeProperties(ctx context.Context, opts SubscribeOptions) (*UnitSubscription[*PropertiesUpdate], error) {
+	return c.propertiesBus.subscribe(ctx, opts, &c.closeWG)
+}
+
 // SetPropertiesSubscriber writes to updateCh when any unit's properties
 // change. Every property change reported by systemd will be sent; that is, no
 // transitions will be "missed" (as they might be with SetSubStateSubscriber).
 // However, state changes will only be written to the channel with non-blocking
 // writes.  If updateCh is full, it attempts to write an error to errCh; if
 // errCh is full, the error passes silently.
+//
+// Calling this method again replaces the previous subscriber; passing a nil
+// update channel removes it. The provided channels are owned by the caller and
+// are not closed by this package. Prefer SubscribeProperties for new code.
 func (c *Conn) SetPropertiesSubscriber(updateCh chan<- *PropertiesUpdate, errCh chan<- error) {
-	c.propertiesSubscriber.Lock()
-	defer c.propertiesSubscriber.Unlock()
-	c.propertiesSubscriber.updateCh = updateCh
-	c.propertiesSubscriber.errCh = errCh
-}
+	c.legacyMu.Lock()
+	defer c.legacyMu.Unlock()
 
-// we don't need to worry about shouldIgnore() here because
-// sendPropertiesUpdate doesn't call GetProperties()
-func (c *Conn) sendPropertiesUpdate(unitPath dbus.ObjectPath, changedProps map[string]dbus.Variant) {
-	c.propertiesSubscriber.Lock()
-	defer c.propertiesSubscriber.Unlock()
+	if c.legacyProps != nil {
+		c.legacyProps.Close()
+		c.legacyProps = nil
+	}
 
-	if c.propertiesSubscriber.updateCh == nil {
+	if updateCh == nil {
 		return
 	}
 
-	update := &PropertiesUpdate{unitName(unitPath), changedProps}
-
-	select {
-	case c.propertiesSubscriber.updateCh <- update:
-	default:
-		msg := "update channel is full"
+	sub, err := c.propertiesBus.subscribeLegacy(c.bgCtx, updateCh, errCh, false, &c.closeWG)
+	if err != nil {
 		select {
-		case c.propertiesSubscriber.errCh <- errors.New(msg):
+		case errCh <- err:
 		default:
-			log.Printf("full error channel while reporting: %s\n", msg)
+			log.Printf("full error channel while reporting: %s\n", err)
 		}
 		return
 	}
+	c.legacyProps = sub
 }
