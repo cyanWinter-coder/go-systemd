@@ -24,9 +24,13 @@ import (
 
 // SdWatchdogEnabled returns watchdog information for a service.
 // Processes should call daemon.SdNotify(false, daemon.SdNotifyWatchdog) every
-// time / 2.
+// time / 2; NewWatchdogHeartbeat implements that loop with bounded intervals.
 // If `unsetEnvironment` is true, the environment variables `WATCHDOG_USEC` and
 // `WATCHDOG_PID` will be unconditionally unset.
+//
+// If WATCHDOG_PID is set, watchdog is enabled only when it names the current
+// process. An unset or empty WATCHDOG_PID follows sd_notify semantics and does
+// not restrict the PID. A disabled watchdog returns (0, nil).
 //
 // It returns one of the following:
 // (0, nil) - watchdog isn't enabled or we aren't the watched PID.
