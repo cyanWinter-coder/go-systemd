@@ -16,7 +16,22 @@ package activation
 
 import "os"
 
+const (
+	// listenFdsStart corresponds to `SD_LISTEN_FDS_START`.
+	listenFdsStart = 3
+
+	// Socket types as reported by getsockopt(SO_TYPE). The numeric values
+	// are the same on every unix platform that supports socket activation.
+	sockOther  = 0
+	sockStream = 1 // SOCK_STREAM
+	sockDgram  = 2 // SOCK_DGRAM
+)
+
 // FilesWithNames maps fd names to a set of os.File pointers.
+//
+// Descriptors without an explicit LISTEN_FDNAMES entry keep their generated
+// "LISTEN_FD_<fd>" name. See [Files] for the validation and environment
+// semantics; malformed activation environments yield an empty map here.
 func FilesWithNames() map[string][]*os.File {
 	files := Files(true)
 	filesWithNames := map[string][]*os.File{}
